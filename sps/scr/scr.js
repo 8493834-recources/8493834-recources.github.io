@@ -1,0 +1,464 @@
+const snails = [
+    { name: "Shelly", species: "Garden Snail", status: "Healthy" },
+    { name: "timmy", species: "Garden Snail", status: "healthy and has EGGS!!!!!" },
+    { name: "Gary", species: "Garden Snail", status: "healthy and has EGGS!!!!!!!" }
+];
+
+const list = document.getElementById('snail-list');
+if (list) {
+    list.innerHTML = ''; 
+    snails.forEach(s => {
+        const card = document.createElement('div');
+        card.className = 'card';
+        card.innerHTML = `<h3>${s.name}</h3><p><strong>Species:</strong> ${s.species}</p><small>Status: ${s.status}</small>`;
+        list.appendChild(card);
+    });
+}
+
+
+async function showPage(pageId) {
+    
+    if (pageId === 'admin') {
+        const { data: { user } } = await supabaseClient.auth.getUser();
+
+        if (!user) {
+            alert("🔒 Security Alert: You must be logged in to access the BOP Command Center!");
+            return;
+        }
+
+        
+        const { data: profile, error } = await supabaseClient
+            .from('profiles')
+            .select('is_admin')
+            .eq('id', user.id)
+            .single();
+
+        if (error || !profile || !profile.is_admin) {
+            alert("❌ ACCESS DENIED! Your account lacks BOP Officer clearance.");
+            return;
+        }
+    }
+
+   
+    const pages = ['home', 'snails', 'report', 'admin', 'account', 'chat', 'feedback'];
+    pages.forEach(p => {
+        const page = document.getElementById(p);
+        if (page) page.classList.add('hidden');
+    });
+    
+    
+    const targetPage = document.getElementById(pageId);
+    if (targetPage) targetPage.classList.remove('hidden');
+    
+    
+    if (pageId === 'chat') loadChatHistory();
+    
+    syncOfflineReports().then(() => {
+        if (pageId === 'admin') loadReports();
+    });
+}
+
+
+function getLocation() {
+    const status = document.getElementById('locationStatus');
+    const geoBtn = document.getElementById('geoBtn');
+    if (!navigator.geolocation) {
+        status.innerText = "Geolocation not supported.";
+        return;
+    }
+    status.innerText = "Tracking...";
+    navigator.geolocation.getCurrentPosition((pos) => {
+        document.getElementById('lat').value = pos.coords.latitude;
+        document.getElementById('lon').value = pos.coords.longitude;
+        status.innerText = "✅ GPS Locked";
+        geoBtn.style.background = "#4caf50";
+    }, () => {
+        status.innerText = "❌ Location denied.";
+    });
+}
+
+const SUPABASE_URL = "https://ocirrwivejnoobjcykkb.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9jaXJyd2l2ZWpub29iamN5a2tiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAxMTE2NDUsImV4cCI6MjA5NTY4NzY0NX0.AK7RLWplAFdL8ap5miJQKtHG_ItiLtg968pW35gmYjg";
+
+const supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+window.addEventListener('load', () => {
+    syncOfflineReports();
+    checkUserSession();
+});
+
+supabaseClient.auth.onAuthStateChange((event, session) => {
+    if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') {
+        checkUserSession();
+    }
+});
+
+const BIN_ID = "6a0d6bca6610dd3ae8753b6c";
+const API_KEY = "$2a$10$cyMnz51JbXNQBoIE7Gi.seT.I2EkWazeGljSLnum7IjzDeOPn5wSi"; 
+const JSONBIN_URL = `https://api.jsonbin.io/v3/b/${BIN_ID}`;
+const KVDB_BUCKET_ID = "DDp2V1oNn6NzaHQ9bmj7gD"; 
+const BACKUP_URL = `https://kvdb.io/${KVDB_BUCKET_ID}/bop_logs`;
+
+async function fetchFromCloud() {
+    try {
+        const res = await fetch(JSONBIN_URL, {
+            method: 'GET',
+            headers: { 'X-Master-Key': API_KEY }
+        });
+        if (res.ok) {
+            const data = await res.json();
+            return { source: 'primary', logs: data.record || [] };
+        }
+    } catch (e) { console.warn("Primary database unreachable. Swapping to backup node...", e); }
+
+    try {
+        const res = await fetch(BACKUP_URL);
+        if (res.ok) {
+            const data = await res.json();
+            return { source: 'backup', logs: data || [] };
+        } else if (res.status === 404) {
+            return { source: 'backup', logs: [] };
+        }
+    } catch (e) { console.error("Backup node also failed. Network is fully dark.", e); }
+
+    throw new Error("All cloud databases unreachable.");
+}
+
+async function uploadToCloud(combinedLogs, targetSource) {
+    if (targetSource === 'primary') {
+        await fetch(JSONBIN_URL, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', 'X-Master-Key': API_KEY },
+            body: JSON.stringify(combinedLogs)
+        });
+    } else if (targetSource === 'backup') {
+        await fetch(BACKUP_URL, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(combinedLogs)
+        });
+    }
+}
+
+const reportForm = document.getElementById('reportForm');
+if (reportForm) {
+    reportForm.addEventListener('submit', async function(e) {
+        e.preventDefault();
+        const submitButton = this.querySelector('button[type="submit"]');
+        submitButton.innerText = "Transmitting...";
+        submitButton.disabled = true;
+
+        const newReport = {
+            id: Date.now().toString(),
+            subject: document.getElementById('subject').value,
+            coords: `${document.getElementById('lat').value || "0"}, ${document.getElementById('lon').value || "0"}`,
+            time: new Date().toLocaleString(),
+        };
+
+        try {
+            const cloudData = await fetchFromCloud();
+            let logs = cloudData.logs;
+            logs.push(newReport);
+
+            await uploadToCloud(logs, cloudData.source);
+            alert(`📡 BOP Discovery Securely Transmitted to Cloud (${cloudData.source === 'primary' ? 'Primary Server' : 'Backup Node'})!`);
+            this.reset();
+            document.getElementById('locationStatus').innerText = "";
+        } catch (err) {
+            let offlineLogs = JSON.parse(localStorage.getItem('bop_offline_logs')) || [];
+            offlineLogs.push(newReport);
+            localStorage.setItem('bop_offline_logs', JSON.stringify(offlineLogs));
+
+            alert("⚠️ All Cloud Nodes Offline! Report securely cached in local storage.");
+            this.reset();
+            document.getElementById('locationStatus').innerText = "";
+        } finally {
+            submitButton.innerText = "Transmit to HQ";
+            submitButton.disabled = false;
+        }
+    });
+}
+
+async function loadReports() {
+    const table = document.getElementById('reportData');
+    if (!table) return;
+    
+    table.innerHTML = `<tr><td colspan="4" style="text-align:center;">Scanning global BOP server matrix...</td></tr>`;
+
+    let cloudLogs = [];
+    let serverStatusText = `<span style="color:green; font-weight:bold;">📡 Live Cloud</span>`;
+    let cloudOffline = false;
+
+    try {
+        const cloudData = await fetchFromCloud();
+        cloudLogs = cloudData.logs;
+        if (cloudData.source === 'backup') {
+            serverStatusText = `<span style="color:#d32f2f; font-weight:bold;">🚨 Backup Node Active</span>`;
+        }
+    } catch (err) {
+        cloudOffline = true;
+    }
+
+    let localLogs = JSON.parse(localStorage.getItem('bop_offline_logs')) || [];
+    table.innerHTML = "";
+
+    if (cloudOffline) {
+        table.innerHTML += `<tr><td colspan="4" style="text-align:center; background:#fff3e0; color:#b71c1c; font-weight:bold;">⚠️ COMPLETE CLOUD BLACKOUT. Displaying Device Storage Only.</td></tr>`;
+    }
+
+    localLogs.slice().reverse().forEach(l => {
+        table.innerHTML += `
+            <tr style="background: #fff8e1;">
+                <td>${l.subject}</td>
+                <td><a href="https://maps.google.com/?q=${l.coords}" target="_blank">View Map</a></td>
+                <td>${l.time}</td>
+                <td><span style="color:#ef6c00; font-weight:bold;">💾 Offline Queue</span></td>
+            </tr>`;
+    });
+
+    cloudLogs.slice().reverse().forEach(l => {
+        table.innerHTML += `
+            <tr>
+                <td>${l.subject}</td>
+                <td><a href="https://maps.google.com/?q=${l.coords}" target="_blank">View Map</a></td>
+                <td>${l.time}</td>
+                <td>${serverStatusText}</td>
+            </tr>`;
+    });
+
+    if (localLogs.length === 0 && cloudLogs.length === 0) {
+        table.innerHTML = `<tr><td colspan="4" style="text-align:center;">No data found. Matrix is quiet.</td></tr>`;
+    }
+}
+
+async function syncOfflineReports() {
+    let localLogs = JSON.parse(localStorage.getItem('bop_offline_logs')) || [];
+    if (localLogs.length === 0) return;
+
+    try {
+        const cloudData = await fetchFromCloud();
+        let combinedLogs = cloudData.logs.concat(localLogs);
+        
+        await uploadToCloud(combinedLogs, cloudData.source);
+        localStorage.removeItem('bop_offline_logs');
+        console.log(`✅ BOP Sync Complete via ${cloudData.source} network!`);
+    } catch (err) {
+        console.warn("📡 BOP Sync paused: Entire grid is down.", err);
+    }
+}
+
+async function clearReports() {
+    if (!confirm("Wipe all logs? This clears both Cloud and Local caches.")) return;
+    localStorage.removeItem('bop_offline_logs');
+
+    try {
+        await fetch(JSONBIN_URL, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', 'X-Master-Key': API_KEY },
+            body: JSON.stringify([])
+        });
+    } catch (err) { console.log("Primary down during wipe."); }
+
+    try {
+        await fetch(BACKUP_URL, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify([{"id": "000", "subject": "System Initialization", "coords": "0,0", "time": "BOP HQ Online"}])
+        });
+    } catch (err) { console.log("Backup down during wipe."); }
+    
+    alert("Logs cleared.");
+    loadReports();
+}
+
+if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sps/sw.js', { scope: '/sps/' })
+        .then(reg => console.log('BOP Service Worker Online', reg.scope))
+        .catch(err => console.log('BOP Worker Failed', err));
+    });
+}
+
+async function signInWithGoogle() {
+    await supabaseClient.auth.signInWithOAuth({ 
+        provider: 'google',
+        options: { 
+            
+            redirectTo: window.location.origin + window.location.pathname 
+        }
+    });
+}
+
+async function signInWithGitHub() {
+    await supabaseClient.auth.signInWithOAuth({ 
+        provider: 'github',
+        options: { redirectTo: window.location.href }
+    });
+}
+
+async function sendChatMessage() {
+    const input = document.getElementById('chatInput');
+    if (!input || !input.value.trim()) return;
+
+    const { data: { user } } = await supabaseClient.auth.getUser();
+    
+    if(!user) { 
+        alert("Transmission Denied! You must be logged into passport services to broadcast."); 
+        return; 
+    }
+
+    const { error } = await supabaseClient.from('chat_messages').insert([
+        { user_id: user.id, username: user.email.split('@')[0], message: input.value }
+    ]);
+    
+    if (error) console.error("Broadcast failed:", error);
+    input.value = "";
+}
+
+supabaseClient
+  .channel('public:chat_messages')
+  .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'chat_messages' }, payload => {
+      const box = document.getElementById('chatDisplay');
+      if (box) {
+          box.innerHTML += `<div class="chat-msg"><span class="chat-user">${payload.new.username}:</span> ${payload.new.message}</div>`;
+          box.scrollTop = box.scrollHeight; 
+      }
+  })
+  .subscribe();
+
+async function checkUserSession() {
+    const { data: { session } } = await supabaseClient.auth.getSession();
+    
+    if (session) {
+        const user = session.user;
+        const accountCard = document.querySelector('#account .card');
+        
+        if (accountCard) {
+            document.querySelectorAll('.btn-auth').forEach(btn => btn.style.display = 'none');
+            
+            let statusText = document.getElementById('authStatusText');
+            if (!statusText) {
+                statusText = document.createElement('p');
+                statusText.id = 'authStatusText';
+                statusText.style.color = 'green';
+                statusText.style.fontWeight = 'bold';
+                accountCard.insertBefore(statusText, accountCard.firstChild);
+            }
+            statusText.innerText = `✅ Securely Logged In: ${user.email}`;
+        }
+
+        let { data: profile } = await supabaseClient
+            .from('profiles')
+            .select('*')
+            .eq('id', user.id);
+
+        if (!profile || profile.length === 0) {
+            console.log("No profile found. Generating new database matrix row...");
+            const tempUsername = user.email.split('@')[0];
+            
+            const { data: newProfile, error: insertError } = await supabaseClient
+                .from('profiles')
+                .insert([
+                    { id: user.id, username: tempUsername, bio: "Field observer.", favorite_bug: "Snail" }
+                ])
+                .select();
+            
+            if (!insertError) profile = newProfile;
+        }
+
+        const activeProfile = Array.isArray(profile) ? profile[0] : profile;
+        if (activeProfile) {
+            const inputs = document.querySelectorAll('#account input, #account textarea');
+            if (inputs[0]) inputs[0].value = activeProfile.username || '';
+            if (inputs[1]) inputs[1].value = activeProfile.bio || '';
+            if (inputs[2]) inputs[2].value = activeProfile.favorite_bug || '';
+        }
+        
+        loadFriendsList(user.id);
+    }
+}
+
+async function loadFriendsList(userId) {
+    const friendsContainer = document.querySelector('#account .card:nth-of-type(2) p');
+    if (!friendsContainer) return;
+    
+    friendsContainer.innerText = "Scanning network for connected partners...";
+    
+    const { data: friends } = await supabaseClient
+        .from('friendships')
+        .select('*')
+        .or(`user_id.eq.${userId},friend_id.eq.${userId}`)
+        .eq('status', 'accepted');
+        
+    if (friends && friends.length > 0) {
+        friendsContainer.innerText = `Found ${friends.length} active field partner(s)!`;
+    } else {
+        friendsContainer.innerText = "No current active connections. Share your handle to add friends!";
+    }
+}
+
+async function saveUserProfile() {
+    const { data: { user } } = await supabaseClient.auth.getUser();
+    if (!user) return alert("Please sign in first!");
+
+    const inputs = document.querySelectorAll('#account input, #account textarea');
+    const username = inputs[0]?.value;
+    const bio = inputs[1]?.value;
+    const favorite_bug = inputs[2]?.value;
+
+    const { error } = await supabaseClient
+        .from('profiles')
+        .upsert({
+            id: user.id,
+            username: username,
+            bio: bio,
+            favorite_bug: favorite_bug
+        });
+
+    if (error) {
+        alert("Failed to save profile: " + error.message);
+    } else {
+        alert("✅ Profile successfully updated!");
+    }
+}
+
+async function loadChatHistory() {
+    const box = document.getElementById('chatDisplay');
+    if (!box) return;
+
+    const { data: messages, error } = await supabaseClient
+        .from('chat_messages')
+        .select('*')
+        .order('created_at', { ascending: true })
+        .limit(20);
+
+    if (error) {
+        console.error("Error loading chat history:", error);
+        return;
+    }
+
+    box.innerHTML = `<div class="chat-msg"><span class="chat-user">HQ Automated Bot:</span> Welcome to global dispatch channel. Communication lines are clear!</div>`;
+    
+    messages.forEach(msg => {
+        box.innerHTML += `<div class="chat-msg"><span class="chat-user">${msg.username}:</span> ${msg.message}</div>`;
+    });
+
+    box.scrollTop = box.scrollHeight;
+}
+
+async function submitFeedback(event) {
+    event.preventDefault();
+    const category = document.getElementById('fbCategory').value;
+    const message = document.getElementById('fbMessage').value;
+
+    const { error } = await supabaseClient
+        .from('feedback')
+        .insert([{ category, message }]);
+
+    if (error) {
+        alert("Transmission error: " + error.message);
+    } else {
+        alert("✅ Feedback securely logged to HQ database!");
+        event.target.reset();
+    }
+}
